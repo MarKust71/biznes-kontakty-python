@@ -17,11 +17,9 @@ Logika:
 """
 from __future__ import annotations
 import os
-import pprint
 import time
-import json
 import logging
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional
 
 import requests
 import psycopg2
@@ -157,18 +155,22 @@ class CEIDGClient:
 
 
 def fetch_aleo_json(nip: str) -> Optional[dict]:
-    # url_tpl = get_env("ALEO_API_URL")
-    # url = url_tpl.format(nip=nip)
-    # for attempt in range(2):
-    #     try:
-    #         r = requests.get(url, timeout=30)
-    #         if r.status_code == 404:
-    #             return None
-    #         r.raise_for_status()
-    #         return r.json()
-    #     except Exception as e:
-    #         logging.warning("Aleo lookup błąd (%s), próba %d", e, attempt + 1)
-    #         time.sleep(1.0 * (attempt + 1))
+    url_tpl = get_env("ALEO_API_URL")
+    api_key = get_env("ALEO_API_KEY")   # pobranie klucza z .env
+    url = url_tpl.format(nip=nip)
+
+    headers = {"x_api_key": api_key}
+
+    for attempt in range(2):
+        try:
+            r = requests.get(url, headers=headers, timeout=30)
+            if r.status_code == 404:
+                return None
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            logging.warning("Aleo lookup błąd (%s), próba %d", e, attempt + 1)
+            time.sleep(1.0 * (attempt + 1))
     return None
 
 
@@ -282,7 +284,7 @@ def run_etl():
                         aleo_json = fetch_aleo_json(nip)
                     else:
                         aleo_json = None
-                    update_aleo(conn, base["ceidg_id"], aleo_json)
+                    update_aleo(conn, base["ceidg_id"], aleo_json.get("results")[0] if aleo_json else None)
                     conn.commit()
                 except Exception as e:
                     conn.rollback()
