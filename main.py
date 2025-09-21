@@ -28,7 +28,8 @@ import psycopg2.extras as pgx
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
 RATE_SLEEP_SECONDS = 3.7  # zachowaj margines bezpieczeństwa dla CEIDG
-NEW_RECORDS_TARGET = 20
+# NEW_RECORDS_TARGET = 20
+NEW_RECORDS_TARGET = 100
 PAGE_SIZE = 25
 
 
@@ -155,22 +156,23 @@ class CEIDGClient:
 
 
 def fetch_aleo_json(nip: str) -> Optional[dict]:
-    url_tpl = get_env("ALEO_API_URL")
-    api_key = get_env("ALEO_API_KEY")   # pobranie klucza z .env
-    url = url_tpl.format(nip=nip)
-
-    headers = {"x_api_key": api_key}
-
-    for attempt in range(2):
-        try:
-            r = requests.get(url, headers=headers, timeout=30)
-            if r.status_code == 404:
-                return None
-            r.raise_for_status()
-            return r.json()
-        except Exception as e:
-            logging.warning("Aleo lookup błąd (%s), próba %d", e, attempt + 1)
-            time.sleep(1.0 * (attempt + 1))
+    # url_tpl = get_env("ALEO_API_URL")
+    # api_key = get_env("ALEO_API_KEY")   # pobranie klucza z .env
+    # url = url_tpl.format(nip=nip)
+    #
+    # headers = {"x_api_key": api_key}
+    #
+    # for attempt in range(2):
+    #     try:
+    #         r = requests.get(url, headers=headers, timeout=30)
+    #         if r.status_code == 404:
+    #             return None
+    #         r.raise_for_status()
+    #         return r.json()
+    #     except Exception as e:
+    #         logging.warning("Aleo lookup błąd (%s), próba %d", e, attempt + 1)
+    #         time.sleep(1.0 * (attempt + 1))
+    #
     return None
 
 
@@ -233,11 +235,12 @@ def map_detail_record(detail: Dict[str, Any]) -> Dict[str, Any]:
 
 def run_etl():
     conn = connect_db()
+
     try:
         ensure_schema(conn)
 
         base_url = get_env("CEIDG_BASE_URL")
-        api_key = os.getenv("CEIDG_API_KEY")
+        api_key = get_env("CEIDG_API_KEY")
         ceidg = CEIDGClient(base_url, api_key)
 
         # Opcjonalnie odczytaj ostatnią stronę
