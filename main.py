@@ -16,6 +16,8 @@ Logika:
   5) Resp. limit: CEIDG 50 zapytań / 180 s => ~1/3.6 s. Używamy stałej przerwy 3.7 s + prosty backoff.
 """
 from __future__ import annotations
+
+import math
 import os
 import time
 import logging
@@ -28,9 +30,10 @@ import psycopg2.extras as pgx
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
 RATE_SLEEP_SECONDS = 3.7  # zachowaj margines bezpieczeństwa dla CEIDG
-# NEW_RECORDS_TARGET = 20
-NEW_RECORDS_TARGET = 100
+CONTACTABLE_TARGET = 18
 PAGE_SIZE = 25
+
+CITY_FILTER = "Wrocław"  # np. "Wrocław"
 
 
 def get_env(name: str, default: Optional[str] = None) -> str:
@@ -79,6 +82,9 @@ DDL = r"""
       CREATE INDEX IF NOT EXISTS idx_companies_email ON ceidg_companies(email);
       CREATE INDEX IF NOT EXISTS idx_companies_phone ON ceidg_companies(phone);
       CREATE INDEX IF NOT EXISTS idx_companies_pkd_year ON ceidg_companies(pkd_year);
+      CREATE INDEX IF NOT EXISTS idx_contactable
+          ON ceidg_companies(ceidg_id)
+          WHERE email IS NOT NULL OR phone IS NOT NULL;
 
 -- Prosty stan crawl'a (opcjonalnie)
       CREATE TABLE IF NOT EXISTS ceidg_crawl_state (
@@ -129,18 +135,23 @@ class CEIDGClient:
         time.sleep(RATE_SLEEP_SECONDS)
 
     def companies(self, page: int) -> Dict[str, Any]:
-        url = f"{self.base}/firmy?page={page}&miasto=Wrocław"
+        url = f"{self.base}/firmy?page={page}" + (f"&miasto={CITY_FILTER}" if CITY_FILTER else "")
         for attempt in range(3):
-            r = self.session.get(url, timeout=30)
-            if r.status_code == 429:
-                logging.warning("429 Too Many Requests – czekam i ponawiam")
-                time.sleep(RATE_SLEEP_SECONDS * (attempt + 2))
-                continue
-            r.raise_for_status()
+            try:
+                r = self.session.get(url, timeout=30)
+                if r.status_code == 429:
+                    logging.warning("429 Too Many Requests – czekam i ponawiam")
+                    time.sleep(RATE_SLEEP_SECONDS * (attempt + 2))
+                    continue
+                r.raise_for_status()
 
-            self._sleep()
-            return r.json()
-        raise RuntimeError("CEIDG /firmy: zbyt wiele nieudanych prób")
+                self._sleep()
+
+                return r.json()
+            except Exception:
+                logging.exception("Błąd przy tworzeniu sesji CEIDG API")
+
+        raise RuntimeError("CEIDG /firmy: zbyt wiele nieudanych prób albo timeout")
 
     def company_detail_by_link(self, link: str) -> Dict[str, Any]:
         for attempt in range(3):
@@ -151,29 +162,10 @@ class CEIDGClient:
                 continue
             r.raise_for_status()
             self._sleep()
+
             return r.json()
+
         raise RuntimeError("CEIDG /firma: zbyt wiele nieudanych prób")
-
-
-def fetch_aleo_json(nip: str) -> Optional[dict]:
-    # url_tpl = get_env("ALEO_API_URL")
-    # api_key = get_env("ALEO_API_KEY")   # pobranie klucza z .env
-    # url = url_tpl.format(nip=nip)
-    #
-    # headers = {"x_api_key": api_key}
-    #
-    # for attempt in range(2):
-    #     try:
-    #         r = requests.get(url, headers=headers, timeout=30)
-    #         if r.status_code == 404:
-    #             return None
-    #         r.raise_for_status()
-    #         return r.json()
-    #     except Exception as e:
-    #         logging.warning("Aleo lookup błąd (%s), próba %d", e, attempt + 1)
-    #         time.sleep(1.0 * (attempt + 1))
-    #
-    return None
 
 
 def ensure_schema(conn):
@@ -187,6 +179,7 @@ def insert_base(conn, row: Dict[str, Any]) -> bool:
     with conn.cursor() as cur:
         cur.execute(UPSERT_BASE, row)
         inserted = cur.rowcount  # 1 jeśli insert, 0 jeśli konflikt
+
     return inserted == 1
 
 
@@ -195,18 +188,15 @@ def update_details(conn, details: Dict[str, Any]):
         cur.execute(UPDATE_DETAILS, details)
 
 
-def update_aleo(conn, ceidg_id: str, aleo_json: Optional[dict]):
-    with conn.cursor() as cur:
-        cur.execute(UPDATE_ALEO, {"ceidg_id": ceidg_id, "aleo": pgx.Json(aleo_json)})
-
-
 def map_base_record(rec: Dict[str, Any]) -> Dict[str, Any]:
+    owner = rec.get("wlasciciel") or {}
+
     return {
         "ceidg_id": rec.get("id"),
         "name": rec.get("nazwa"),
         "date_start": rec.get("dataRozpoczecia"),
         "status": rec.get("status"),
-        "nip": rec.get("wlasciciel").get("nip"),
+        "nip": owner.get("nip"),
         "link": rec.get("link"),  # pełny URL do szczegółów
     }
 
@@ -233,83 +223,126 @@ def map_detail_record(detail: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def existing_ids(conn, ids: list[str]) -> set[str]:
+    if not ids:
+        return set()
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT ceidg_id FROM ceidg_companies WHERE ceidg_id = ANY(%s)",
+            (ids,)
+        )
+
+        return {row[0] for row in cur.fetchall()}
+
+
+def is_contactable_mapped(mapped: dict) -> bool:
+    return bool(mapped.get("phone")) or bool(mapped.get("email"))
+
+
 def run_etl():
     conn = connect_db()
-
     try:
         ensure_schema(conn)
 
         base_url = get_env("CEIDG_BASE_URL")
-        api_key = get_env("CEIDG_API_KEY")
+        api_key = os.getenv("CEIDG_API_KEY")
         ceidg = CEIDGClient(base_url, api_key)
 
-        # Opcjonalnie odczytaj ostatnią stronę
-        with conn.cursor(cursor_factory=pgx.DictCursor) as cur:
-            cur.execute("SELECT last_page FROM ceidg_crawl_state WHERE id=1")
-            row = cur.fetchone()
-            current_page = int(row[0]) if row else 0
+        contactable_added = 0
+        current_page = 0
 
-        total_inserted = 0
-        while total_inserted < NEW_RECORDS_TARGET:
-            logging.info("Pobieram /firmy, strona=%s", current_page)
+        # Opcjonalne: jeśli przez X kolejnych stron wszystkie 25 firm już jest w bazie,
+        # to przerywamy, bo najpewniej nic nowego nie ma
+        all_known_pages_limit = 300
+        all_known_streak = 0
+
+        while contactable_added < CONTACTABLE_TARGET:
             data = ceidg.companies(page=current_page)
             count_total = data.get("count")
-            items = data.get("firmy") or data.get("items") or data.get("data") or []  # dopasuj do faktycznego pola listy
+            if current_page == 0:
+                logging.info("Pobieram /firmy, firm ogółem=%s, strony=0-%s", count_total, math.floor(count_total/PAGE_SIZE))
+
+            logging.info("Pobieram /firmy, strona=%s", current_page)
+            items = data.get("firmy") or data.get("items") or data.get("data") or []
             if not items:
-                logging.info("Brak elementów na stronie %s – przerywam", current_page)
+                logging.info("Brak elementów na stronie %s – przerywam.", current_page)
                 break
 
+            page_known_only = True  # założenie: wszystkie znane, obalimy gdy znajdziemy nową
+
+            ids = [r.get("id") for r in items if r.get("id")]
+            known = existing_ids(conn, ids)
             for rec in items:
+                ceidg_id = rec.get("id")
+                if not ceidg_id or ceidg_id in known:
+                    continue
+
+                page_known_only = False  # jednak trafiliśmy nową
+
+                # 1) Insert podstawy
                 base = map_base_record(rec)
                 try:
                     inserted = insert_base(conn, base)
                     conn.commit()
-                except Exception as e:
+                except Exception:
                     conn.rollback()
-                    logging.exception("Błąd insertu podstawy dla %s: %s", base.get("ceidg_id"), e)
+                    logging.exception("Błąd insertu podstawy dla %s", ceidg_id)
                     continue
 
-                # Szczegóły
+                if not inserted:
+                    # Rzadki przypadek wyścigu – ktoś wstawił równolegle
+                    continue
+
+                # 2) Pobierz szczegóły i zaktualizuj
                 try:
                     detail_json = ceidg.company_detail_by_link(base["link"]) if base.get("link") else {}
-                    details = map_detail_record(detail_json.get("firma")[0])
-                    details["ceidg_id"] = base["ceidg_id"]
+
+                    firmy_list = detail_json.get("firma") or []   # może być None, więc zamieniamy na []
+                    if not firmy_list:
+                        logging.warning("Brak szczegółów firmy w API dla ceidg_id=%s", ceidg_id)
+                        continue   # pomijamy ten rekord bez aktualizacji
+
+                    details = map_detail_record(firmy_list[0])
+                    details["ceidg_id"] = ceidg_id
                     update_details(conn, details)
                     conn.commit()
-                except Exception as e:
+                except Exception:
                     conn.rollback()
-                    logging.exception("Błąd aktualizacji szczegółów %s: %s", base.get("ceidg_id"), e)
+                    logging.exception("Błąd aktualizacji szczegółów %s", ceidg_id)
+                    continue
 
-                # Wzbogacenie ALEO po NIP
+                # 3) Licznik tylko dla rekordów z telefonem lub emailem
                 try:
-                    nip = base.get("nip")
-                    if nip:
-                        aleo_json = fetch_aleo_json(nip)
-                    else:
-                        aleo_json = None
-                    update_aleo(conn, base["ceidg_id"], aleo_json.get("results")[0] if aleo_json else None)
-                    conn.commit()
-                except Exception as e:
-                    conn.rollback()
-                    logging.exception("Błąd aktualizacji ALEO %s: %s", base.get("ceidg_id"), e)
+                    if is_contactable_mapped(details):
+                        contactable_added += 1
+                        logging.info(
+                            "Nowy kontaktowalny (%d/%d): %s",
+                            contactable_added, CONTACTABLE_TARGET, base.get("name")
+                        )
+                        if contactable_added >= CONTACTABLE_TARGET:
+                            break
+                except Exception:
+                    logging.exception("Błąd przy sprawdzaniu kontaktowalności %s", ceidg_id)
 
-                if inserted:
-                    total_inserted += 1
-                    logging.info("Dodano nowy rekord (%d/%d): %s", total_inserted, NEW_RECORDS_TARGET, base.get("name"))
-                    if total_inserted >= NEW_RECORDS_TARGET:
-                        break
+            # zarządzanie końcem / przejściem do kolejnej strony
+            if page_known_only:
+                all_known_streak += 1
+            else:
+                all_known_streak = 0
 
-            # Zapisz postęp strony
-            with conn.cursor() as cur:
-                cur.execute("UPDATE ceidg_crawl_state SET last_page=%s, last_run_at=now() WHERE id=1", (current_page,))
-            conn.commit()
+            if all_known_streak >= all_known_pages_limit:
+                logging.info(
+                    "Ostatnie %d stron zawierało wyłącznie znane rekordy – kończę.",
+                    all_known_pages_limit
+                )
+                break
 
             current_page += 1
             if count_total is not None and current_page * PAGE_SIZE >= int(count_total):
                 logging.info("Osiągnięto koniec wyników (%s)", count_total)
                 break
 
-        logging.info("Zakończono. Nowe rekordy dodane: %d", total_inserted)
+        logging.info("Zakończono. Dodano nowych kontaktowalnych: %d", contactable_added)
 
     finally:
         conn.close()
